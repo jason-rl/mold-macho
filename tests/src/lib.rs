@@ -70,9 +70,9 @@ fn run_one(job: &TestJob, root: &Path, linker: &Path) -> (Outcome, String) {
 }
 
 /// Discovers and runs the test scripts in `cases`, using the linker at
-/// `linker`. Command line arguments are substring patterns selecting a
-/// subset of tests.
-pub fn run(cases: &Path, linker: &Path) -> ExitCode {
+/// `linker`, restricted to its enabled architectures. Command line arguments
+/// are substring patterns selecting a subset of tests.
+pub fn run(cases: &Path, linker: &Path, enabled_archs: &[&str]) -> ExitCode {
     let patterns: Vec<String> = env::args().skip(1).filter(|a| !a.starts_with('-')).collect();
 
     let mut jobs = Vec::new();
@@ -82,7 +82,10 @@ pub fn run(cases: &Path, linker: &Path) -> ExitCode {
         .collect();
     entries.sort();
 
-    let archs = test_archs();
+    let archs: Vec<_> = test_archs()
+        .into_iter()
+        .filter(|arch| enabled_archs.contains(arch))
+        .collect();
     for path in entries {
         if path.extension().map_or(true, |e| e != "sh") {
             continue;

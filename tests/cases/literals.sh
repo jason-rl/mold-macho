@@ -3,8 +3,7 @@ source "$(dirname "$0")"/common.inc
 
 # Only x86-64 clang materializes doubles from __literal8; arm64 code
 # synthesizes them with mov/movk sequences.
-CC="cc -arch x86_64"
-arch -x86_64 /usr/bin/true 2> /dev/null || skip
+[ "$ARCH" = x86_64 ] || skip
 
 cat <<EOF | $CC -o $t/a.o -c -xc -
 double pi1() { return 3.1415926535; }

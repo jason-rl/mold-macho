@@ -24,6 +24,32 @@ Build with `cargo build --release`. The binary is `target/release/mold`;
     swiftc -o hello hello.swift -use-ld=path/to/ld64.mold
     RUSTFLAGS="-C link-arg=--ld-path=path/to/ld64.mold" cargo build
 
+## Binary releases
+
+Pushes to `main` build native Apple Silicon and Intel binaries on macOS 26,
+targeting macOS 15 or later, with fat LTO and one codegen unit. Tests run on
+macOS 26; macOS 15 is not tested separately. New pushes cancel superseded
+builds.
+
+Each completed build publishes an immutable release tagged
+`sha-<full-commit-SHA>`, with `mold-macho-aarch64-apple-darwin.tar.gz`,
+`mold-macho-x86_64-apple-darwin.tar.gz`, and `SHA256SUMS`. Each archive
+contains `bin/mold`, a `bin/ld64.mold` symlink, and `LICENSE`. Each release
+binary is built and tested with only its matching architecture enabled.
+Local builds still enable both architectures by default. To verify both
+downloaded archives:
+
+    shasum -a 256 -c SHA256SUMS
+
+Extract the archive for your Mac and point your compiler at its
+`bin/ld64.mold`, or copy both entries in `bin/` to a directory on your PATH.
+
+The release workflow requires **Settings > General > Releases > Enable
+release immutability** to be enabled in GitHub. It creates a draft release,
+uploads both archives and checksums, then publishes the release to lock its
+assets. Reruns can resume incomplete draft releases but never replace
+published releases.
+
 ## Feature highlights
 
 - Classic dyld info and chained fixups (the default for deployment

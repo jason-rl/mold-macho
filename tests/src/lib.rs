@@ -6,6 +6,7 @@
 //! host; there is no cross-linking support yet.
 
 use std::env;
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::sync::Mutex;
@@ -70,10 +71,20 @@ fn run_one(job: &TestJob, root: &Path, linker: &Path) -> (Outcome, String) {
 }
 
 /// Discovers and runs the test scripts in `cases`, using the linker at
-/// `linker`. Command line arguments are substring patterns selecting a
-/// subset of tests.
-pub fn run(cases: &Path, linker: &Path) -> ExitCode {
+/// `linker`, restricted to its enabled architectures. Command line arguments
+/// are substring patterns selecting a subset of tests.
+pub fn run(cases: &Path, linker: &Path, enabled_archs: &[&str]) -> ExitCode {
     let patterns: Vec<String> = env::args().skip(1).filter(|a| !a.starts_with('-')).collect();
+    let color = match env::var("CARGO_TERM_COLOR").as_deref() {
+        Ok("always") => true,
+        Ok("never") => false,
+        _ => io::stdout().is_terminal(),
+    };
+    let (pass, skip, fail) = if color {
+        ("\x1b[32mOK\x1b[0m", "\x1b[33mskipped\x1b[0m", "\x1b[31mFAILED\x1b[0m")
+    } else {
+        ("OK", "skipped", "FAILED")
+    };
 
     let mut jobs = Vec::new();
     let mut entries: Vec<_> = std::fs::read_dir(cases)
@@ -82,7 +93,10 @@ pub fn run(cases: &Path, linker: &Path) -> ExitCode {
         .collect();
     entries.sort();
 
-    let archs = test_archs();
+    let archs: Vec<_> = test_archs()
+        .into_iter()
+        .filter(|arch| enabled_archs.contains(arch))
+        .collect();
     for path in entries {
         if path.extension().map_or(true, |e| e != "sh") {
             continue;
@@ -123,10 +137,10 @@ pub fn run(cases: &Path, linker: &Path) -> ExitCode {
 
                 let (outcome, log) = run_one(job, &root, &linker);
                 match outcome {
-                    Outcome::Pass => println!("Testing {} ... OK", job.name),
-                    Outcome::Skip => println!("Testing {} ... skipped", job.name),
+                    Outcome::Pass => println!("Testing {} ... {pass}", job.name),
+                    Outcome::Skip => println!("Testing {} ... {skip}", job.name),
                     Outcome::Fail => {
-                        println!("Testing {} ... FAILED", job.name);
+                        println!("Testing {} ... {fail}", job.name);
                         failed.lock().unwrap().push((job.name.clone(), log));
                     }
                 }

@@ -1,0 +1,177 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_RELEASE_LTO: fat
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
+  CARGO_TERM_COLOR: always
+  MACOSX_DEPLOYMENT_TARGET: "15.0"
+  RUSTUP_TOOLCHAIN: "1.98.1"
+  SCCACHE_GHA_ENABLED: "true"
+  SCCACHE_IDLE_TIMEOUT: "0"
+  SCCACHE_LOG: warn
+
+jobs:
+  build:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-26
+            target: aarch64-apple-darwin
+            arch: arm64
+          - runner: macos-26-intel
+            target: x86_64-apple-darwin
+            arch: x86_64
+    env:
+      TARGET: ${{ matrix.target }}
+      ARCH: ${{ matrix.arch }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+      - name: Set up Rust
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target "$TARGET"
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          cache-targets: false
+          key: ${{ matrix.target }}
+      - name: Configure sccache error log
+        run: echo "SCCACHE_ERROR_LOG=${RUNNER_TEMP}/sccache-error.log" >> "$GITHUB_ENV"
+      - name: Set up sccache
+        id: sccache
+        continue-on-error: true
+        uses: Mozilla-Actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba
+      - name: Enable sccache
+        if: steps.sccache.outcome == 'success'
+        run: echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+      - name: Build release binary
+        run: cargo build --release --locked --package mold-macho-cli --no-default-features --features "$ARCH" --target "$TARGET" --timings
+      - name: Run tests
+        run: cargo test --release --locked --package mold-macho-cli --no-default-features --features "$ARCH" --target "$TARGET" -- --color=always
+      - name: Package and verify binary
+        run: |
+          stage="$RUNNER_TEMP/package"
+          mkdir -p "$stage/bin"
+          install -m 755 "target/$TARGET/release/mold" "$stage/bin/mold"
+          install -m 644 LICENSE "$stage/LICENSE"
+          ln -s mold "$stage/bin/ld64.mold"
+          test "$(lipo -archs "$stage/bin/mold")" = "$ARCH"
+          xcrun vtool -show-build "$stage/bin/mold" | tee "$RUNNER_TEMP/build-version.txt"
+          awk '/minos/ { found = 1; if ($2 != "15.0") exit 1 } END { if (!found) exit 1 }' "$RUNNER_TEMP/build-version.txt"
+          COPYFILE_DISABLE=1 tar -czf "$RUNNER_TEMP/mold-macho-$TARGET.tar.gz" -C "$stage" bin LICENSE
+          verify="$RUNNER_TEMP/verify"
+          mkdir -p "$verify"
+          tar -xzf "$RUNNER_TEMP/mold-macho-$TARGET.tar.gz" -C "$verify"
+          test -x "$verify/bin/mold"
+          test "$(readlink "$verify/bin/ld64.mold")" = mold
+          cmp LICENSE "$verify/LICENSE"
+          echo 'int main(void) { return 0; }' > "$verify/hello.c"
+          clang -arch "$ARCH" --ld-path="$verify/bin/ld64.mold" "$verify/hello.c" -o "$verify/hello"
+          "$verify/hello"
+      - name: Upload release archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          path: ${{ runner.temp }}/mold-macho-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          archive: false
+          retention-days: 1
+      - name: Report sccache statistics
+        if: always() && steps.sccache.outcome == 'success'
+        run: sccache --show-stats || echo "::warning::Unable to read sccache statistics"
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: diagnostics-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/sccache-error.log
+            ${{ runner.temp }}/build-version.txt
+            target/cargo-timings/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: mold-macho-*.tar.gz
+          merge-multiple: true
+          path: ${{ runner.temp }}/release
+      - name: Publish immutable release
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          RELEASE_DIR: ${{ runner.temp }}/release
+        with:
+          script: |
+            const { readFile } = require('node:fs/promises');
+            const { join } = require('node:path');
+            const { createHash } = require('node:crypto');
+            const repo = context.repo;
+            const sha = context.sha;
+            const tag = `sha-${sha}`;
+
+            let release;
+            for await (const { data } of github.paginate.iterator(github.rest.repos.listReleases, { ...repo, per_page: 100 })) {
+              release = data.find(item => item.tag_name === tag);
+              if (release) break;
+            }
+            if (release && !release.draft) {
+              core.info(`Already published: ${release.html_url}`);
+              return;
+            }
+            const files = await Promise.all(['aarch64', 'x86_64'].map(async arch => {
+              const name = `mold-macho-${arch}-apple-darwin.tar.gz`;
+              return { name, data: await readFile(join(process.env.RELEASE_DIR, name)) };
+            }));
+            const checksums = files.map(({ name, data }) => `${createHash('sha256').update(data).digest('hex')}  ${name}\n`).join('');
+            files.push({ name: 'SHA256SUMS', data: Buffer.from(checksums) });
+
+            if (!release) {
+              ({ data: release } = await github.rest.repos.createRelease({
+                ...repo, tag_name: tag, target_commitish: sha, draft: true,
+                name: `mold-macho ${sha}`,
+                body: `Built from commit ${sha}.\n\nmacOS 15 or later; tested on macOS 26. Each binary links only its matching architecture.\n\nVerify downloads with \`shasum -a 256 -c SHA256SUMS\`.`,
+              }));
+            }
+            // Replace only draft assets left by an interrupted run.
+            for (const asset of release.assets) {
+              await github.rest.repos.deleteReleaseAsset({ ...repo, asset_id: asset.id });
+            }
+            for (const file of files) {
+              await github.rest.repos.uploadReleaseAsset({
+                ...repo, release_id: release.id, ...file,
+                headers: { 'content-type': 'application/octet-stream' },
+              });
+            }
+            const { data: branch } = await github.rest.repos.getBranch({ ...repo, branch: 'main' });
+            if (branch.commit.sha !== sha) {
+              core.info('Superseded commit; leaving draft unpublished.');
+              return;
+            }
+            await github.rest.repos.updateRelease({ ...repo, release_id: release.id, draft: false, make_latest: 'true' });
+            core.info(`Published: ${release.html_url}`);
